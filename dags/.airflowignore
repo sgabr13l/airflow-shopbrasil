@@ -1,0 +1,3 @@
+# O pacote shopbrasil/ contem apenas modulos de apoio (config, metricas, API,
+# banco). Ignora-lo evita que o DAG processor tente parsea-lo como DAG.
+shopbrasil/

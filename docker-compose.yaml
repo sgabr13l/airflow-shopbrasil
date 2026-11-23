@@ -1,0 +1,156 @@
+# =============================================================================
+# ShopBrasil - Pipeline de precos por categoria (Apache Airflow 2.11)
+# =============================================================================
+#
+# Projeto isolado: containers, rede e volumes recebem o prefixo
+# "shopbrasil-airflow". `docker compose down -v` remove apenas o que e deste
+# projeto, sem tocar em outros stacks do mesmo Docker.
+#
+# Servicos:
+#   postgres-airflow    banco de metadados do Airflow (interno, sem porta no host)
+#   postgres-analytics  base analitica onde o pipeline grava as metricas
+#   airflow-init        prepara o ambiente (roda uma vez e encerra):
+#                         - migra o banco de metadados
+#                         - cria o usuario admin da UI
+#                         - cria o pool ecommerce_pool (2 slots)
+#                         - cria a connection postgres_analytics
+#   airflow-webserver   interface web
+#   airflow-scheduler   agenda e executa as tasks (LocalExecutor)
+#
+# Todas as variaveis tem valor padrao (${VAR:-padrao}), entao o projeto sobe
+# mesmo sem arquivo .env. Veja .env.example para customizar.
+# =============================================================================
+
+name: shopbrasil-airflow
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE:-apache/airflow:2.11.2-python3.12}
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-shopbrasil-dev-secret}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on: &airflow-common-depends-on
+    postgres-airflow:
+      condition: service_healthy
+    postgres-analytics:
+      condition: service_healthy
+
+services:
+  postgres-airflow:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: on-failure
+
+  postgres-analytics:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${ANALYTICS_USER:-shopbrasil}
+      POSTGRES_PASSWORD: ${ANALYTICS_PASSWORD:-shopbrasil}
+      POSTGRES_DB: ${ANALYTICS_DB:-shopbrasil}
+    ports:
+      - "${ANALYTICS_PORT:-5433}:5432"
+    volumes:
+      - analytics-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: on-failure
+
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+
+        echo ">> Ajustando permissoes das pastas montadas"
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+
+        echo ">> Migrando banco de metadados e criando usuario admin"
+        /entrypoint airflow version
+
+        echo ">> Criando pool ecommerce_pool (2 slots)"
+        airflow pools set ecommerce_pool 2 "Limita a concorrencia das tasks mapeadas por categoria"
+
+        echo ">> Criando connection postgres_analytics"
+        airflow connections delete postgres_analytics > /dev/null 2>&1 || true
+        airflow connections add postgres_analytics \
+          --conn-type postgres \
+          --conn-host postgres-analytics \
+          --conn-port 5432 \
+          --conn-schema "${ANALYTICS_DB:-shopbrasil}" \
+          --conn-login "${ANALYTICS_USER:-shopbrasil}" \
+          --conn-password "${ANALYTICS_PASSWORD:-shopbrasil}" \
+          --conn-description "Base analitica da ShopBrasil (metricas de preco por categoria)"
+
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        echo ">> Ambiente pronto"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: on-failure
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: on-failure
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow-metadata:
+  analytics-data:
